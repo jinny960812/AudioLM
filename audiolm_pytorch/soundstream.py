@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import functools
 from pathlib import Path
 from functools import partial, wraps
 from itertools import cycle, zip_longest
-from typing import Optional, List
 
 import torch
 from torch import nn, einsum
@@ -455,14 +456,15 @@ class SoundStream(Module):
         strides = (2, 4, 5, 8),
         channel_mults = (2, 4, 8, 16),
         codebook_dim = 512,
-        codebook_size: Optional[int] = None,
-        finite_scalar_quantizer_levels: Optional[List[int]] = None,
+        codebook_size: int | None = None,
+        finite_scalar_quantizer_levels: list[int] | None = None,
         rq_num_quantizers = 8,
         rq_commitment_weight = 1.,
         rq_ema_decay = 0.95,
         rq_quantize_dropout_multiple_of = 1,
         rq_groups = 1,
         rq_stochastic_sample_codes = False,
+        rq_rotation_trick = True,
         rq_kwargs: dict = {},
         use_lookup_free_quantizer = False,              # proposed in https://arxiv.org/abs/2310.05737, adapted for residual quantization
         use_finite_scalar_quantizer = False,            # proposed in https://arxiv.org/abs/2309.15505, adapted for residual quantization
@@ -491,7 +493,7 @@ class SoundStream(Module):
         squeeze_excite = False,
         complex_stft_discr_logits_abs = True,
         pad_mode = 'reflect',
-        stft_discriminator: Optional[Module] = None,  # can pass in own stft discriminator
+        stft_discriminator: Module | None = None,  # can pass in own stft discriminator
         complex_stft_discr_kwargs: dict = dict()
     ):
         super().__init__()
@@ -600,6 +602,7 @@ class SoundStream(Module):
                 quantize_dropout = True,
                 quantize_dropout_cutoff_index = quantize_dropout_cutoff_index,
                 stochastic_sample_codes = rq_stochastic_sample_codes,
+                rotation_trick = rq_rotation_trick,
                 **rq_kwargs
             )
 

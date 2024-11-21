@@ -26,7 +26,7 @@ setup(
     'encodec',
     'fairseq',
     'wandb',
-    'gateloop-transformer>=0.5.2',
+    'gateloop-transformer>=0.2.3',
     'joblib',
     'local-attention>=1.9.0',
     'pytorch-warmup',
@@ -36,7 +36,7 @@ setup(
     'torchaudio',
     'transformers',
     'tqdm',
-    'vector-quantize-pytorch>=1.12.5'
+    'vector-quantize-pytorch>=1.19.3'
   ],
   classifiers=[
     'Development Status :: 4 - Beta',

@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import math
 from functools import partial, wraps
 
-from beartype.typing import Optional, Union, List
 from beartype import beartype
 
 import torch
@@ -310,6 +311,8 @@ class Attention(nn.Module):
         prefix_context = None,
         prefix_context_mask = None,
         return_kv_cache = False,
+        return_values = False,
+        value_residual: Tensor | None = None,
         kv_cache = None
     ):
         b, n, _, device = *x.shape, x.device
@@ -344,6 +347,13 @@ class Attention(nn.Module):
         # project for queries, keys, values
 
         q, k, v = self.to_q(x), *self.to_kv(kv_input).chunk(2, dim = -1)
+
+        # for value residual learning
+
+        orig_v = v
+
+        if exists(value_residual):
+            v = 0.5 * (v + value_residual)
 
         # kv cache
 
@@ -382,10 +392,16 @@ class Attention(nn.Module):
         out = rearrange(out, 'b h n d -> b n (h d)')
         out = self.to_out(out)
 
-        if not return_kv_cache:
+        if not return_kv_cache and not return_values:
             return out
 
-        return out, kv_cache
+        if return_kv_cache and not return_values:
+            return out, kv_cache
+
+        if return_values and not return_kv_cache:
+            return out, orig_v
+
+        return out, (kv_cache, orig_v)
 
 # transformer
 
@@ -404,6 +420,7 @@ class Transformer(nn.Module):
         cond_as_self_attn_prefix = False,
         rel_pos_bias = True,
         flash_attn = False,
+        add_value_residual = True,
         **kwargs
     ):
         super().__init__()
@@ -429,6 +446,8 @@ class Transformer(nn.Module):
             ]))
 
         self.norm = LayerNorm(dim)
+
+        self.add_value_residual = add_value_residual
 
     def forward(
         self,
@@ -486,13 +505,22 @@ class Transformer(nn.Module):
                 prefix_context_mask = context_mask
             )
 
+        # value residuals
+
+        self_attn_value_residual = None
+        cross_attn_value_residual = None
+
         # transformer layers
 
         for attn, cross_attn, ff in self.layers:
 
             residual = x
 
-            attn_out, layer_kv_cache = attn(x, attn_bias = rel_pos_bias, mask = self_attn_mask, kv_cache = next(kv_cache, None), return_kv_cache = True, **self_attn_kwargs)
+            x, (layer_kv_cache, values) = attn(x, attn_bias = rel_pos_bias, mask = self_attn_mask, kv_cache = next(kv_cache, None), return_kv_cache = True, return_values = True, value_residual = self_attn_value_residual, **self_attn_kwargs)
+
+            if self.add_value_residual:
+                self_attn_value_residual = default(self_attn_value_residual, values)
+
             new_kv_cache.append(layer_kv_cache)
 
             x = x + residual
@@ -500,7 +528,11 @@ class Transformer(nn.Module):
             if exists(cross_attn):
                 assert exists(context)
 
-                x = cross_attn(x, context = context, mask = context_mask) + x
+                cross_attend_out, values = cross_attn(x, context = context, mask = context_mask, return_values = True, value_residual = cross_attn_value_residual)
+                x = cross_attend_out + x
+
+                if self.add_value_residual:
+                    cross_attn_value_residual = default(cross_attn_value_residual, values)
 
             x = ff(x) + x
 
@@ -625,7 +657,7 @@ class SemanticTransformer(nn.Module):
         *,
         ids = None,
         return_loss = False,
-        text: Optional[List[str]] = None,
+        text: list[str] | None = None,
         text_embeds = None,
         self_attn_mask = None,
         cond_drop_prob = None,
@@ -813,7 +845,7 @@ class CoarseTransformer(nn.Module):
         semantic_token_ids,
         coarse_token_ids,
         self_attn_mask = None,
-        text: Optional[List[str]] = None,
+        text: list[str] | None = None,
         text_embeds = None,
         cond_drop_prob = None,
         return_only_coarse_logits = False,
@@ -1089,7 +1121,7 @@ class FineTransformer(nn.Module):
         self,
         coarse_token_ids,
         fine_token_ids,
-        text: Optional[List[str]] = None,
+        text: list[str] | None = None,
         text_embeds = None,
         cond_drop_prob = None,
         self_attn_mask = None,
@@ -1327,8 +1359,8 @@ class SemanticTransformerWrapper(nn.Module):
         self,
         *,
         transformer: SemanticTransformer,
-        wav2vec: Optional[Union[FairseqVQWav2Vec, HubertWithKmeans]] = None,
-        audio_conditioner: Optional[AudioConditionerBase] = None,
+        wav2vec: FairseqVQWav2Vec | HubertWithKmeans | None = None,
+        audio_conditioner: AudioConditionerBase | None = None,
         pad_id = -1,
         unique_consecutive = True,
         mask_prob = 0.15
@@ -1362,7 +1394,7 @@ class SemanticTransformerWrapper(nn.Module):
         self,
         *,
         max_length,
-        text: Optional[List[str]] = None,
+        text: list[str] | None = None,
         text_embeds = None,
         prime_wave = None,
         prime_wave_input_sample_hz = None,
@@ -1524,9 +1556,9 @@ class CoarseTransformerWrapper(nn.Module):
         self,
         *,
         transformer: CoarseTransformer,
-        codec: Optional[Union[SoundStream, EncodecWrapper]]  = None,
-        wav2vec: Optional[Union[FairseqVQWav2Vec, HubertWithKmeans]] = None,
-        audio_conditioner: Optional[AudioConditionerBase] = None,
+        codec: SoundStream | EncodecWrapper | None  = None,
+        wav2vec: FairseqVQWav2Vec | HubertWithKmeans | None = None,
+        audio_conditioner: AudioConditionerBase | None = None,
         pad_id = -1,
         unique_consecutive = True,
         semantic_cross_entropy_loss_weight = 1.,
@@ -1564,10 +1596,10 @@ class CoarseTransformerWrapper(nn.Module):
         self,
         *,
         semantic_token_ids,
-        prime_wave: Optional[Tensor] = None,
+        prime_wave: Tensor | None = None,
         prime_wave_input_sample_hz = None,
-        prime_coarse_token_ids: Optional[Tensor] = None,
-        text: Optional[List[str]] = None,
+        prime_coarse_token_ids: Tensor | None = None,
+        text: list[str] | None = None,
         text_embeds = None,
         max_time_steps = 512,
         cond_scale = 3.,
@@ -1811,8 +1843,8 @@ class FineTransformerWrapper(nn.Module):
         self,
         *,
         transformer: FineTransformer,
-        codec: Optional[Union[SoundStream, EncodecWrapper]] = None,
-        audio_conditioner: Optional[AudioConditionerBase] = None,
+        codec: SoundStream | EncodecWrapper | None = None,
+        audio_conditioner: AudioConditionerBase | None = None,
         coarse_cross_entropy_loss_weight = 1.,
         pad_id = -1,
         mask_prob = 0.15
@@ -1852,10 +1884,10 @@ class FineTransformerWrapper(nn.Module):
         self,
         *,
         coarse_token_ids,
-        prime_wave: Optional[Tensor] = None,
+        prime_wave: Tensor | None = None,
         prime_wave_input_sample_hz = None,
-        prime_fine_token_ids: Optional[Tensor] = None,
-        text: Optional[List[str]] = None,
+        prime_fine_token_ids: Tensor | None = None,
+        text: list[str] | None = None,
         text_embeds = None,
         cond_scale = 3.,
         filter_thres = 0.9,
@@ -2095,12 +2127,12 @@ class AudioLM(nn.Module):
     def __init__(
         self,
         *,
-        wav2vec: Optional[Union[FairseqVQWav2Vec, HubertWithKmeans]], 
-        codec: Union[SoundStream, EncodecWrapper],
+        wav2vec: FairseqVQWav2Vec | HubertWithKmeans | None, 
+        codec: SoundStream | EncodecWrapper,
         semantic_transformer: SemanticTransformer,
         coarse_transformer: CoarseTransformer,
         fine_transformer: FineTransformer,
-        audio_conditioner: Optional[AudioConditionerBase] = None,
+        audio_conditioner: AudioConditionerBase | None = None,
         unique_consecutive = True
     ):
         super().__init__()
@@ -2148,8 +2180,8 @@ class AudioLM(nn.Module):
         self,
         *,
         batch_size = 1,
-        text: Optional[List[str]] = None,
-        text_embeds: Optional[Tensor] = None,
+        text: list[str] | None = None,
+        text_embeds: Tensor | None = None,
         prime_wave = None,
         prime_wave_input_sample_hz = None,
         prime_wave_path = None,
